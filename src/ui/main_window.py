@@ -15,6 +15,8 @@ from src.core.drive_detector import (
     format_size,
 )
 from src.core.rom_manager import add_roms, delete_games, build_file_dialog_filter
+from src.ui.toast import ToastManager
+from src.ui.dialogs import OverwriteDialog
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -50,11 +52,6 @@ COLOR_BG           = "#1a1a1a"
 
 
 class VirtualListbox(ctk.CTkFrame):
-    """
-    Canvas tabanlı sanal liste — tüm ROM'ları anında render eder.
-    Scroll sonrası görünür alanı yeniden çizer (virtual rendering).
-    """
-
     def __init__(self, master, on_selection_change=None, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.grid_columnconfigure(0, weight=1)
@@ -67,12 +64,9 @@ class VirtualListbox(ctk.CTkFrame):
         self._row_height = ROW_HEIGHT
         self._on_selection_change = on_selection_change
 
-        self._canvas = Canvas(
-            self, bg=COLOR_BG, bd=0, highlightthickness=0, relief="flat",
-        )
+        self._canvas = Canvas(self, bg=COLOR_BG, bd=0, highlightthickness=0, relief="flat")
         self._canvas.grid(row=0, column=0, sticky="nsew")
 
-        # Scrollbar — yview komutunu yakalayarak _redraw'u tetikliyoruz
         self._scrollbar = ctk.CTkScrollbar(self, command=self._yview_and_redraw)
         self._scrollbar.grid(row=0, column=1, sticky="ns")
         self._canvas.configure(yscrollcommand=self._scrollbar.set)
@@ -84,16 +78,12 @@ class VirtualListbox(ctk.CTkFrame):
         self._canvas.bind("<Leave>", self._on_leave)
 
     def _yview_and_redraw(self, *args):
-        """Scrollbar'dan gelen yview komutunu canvas'a iletir ve yeniden çizer."""
         self._canvas.yview(*args)
         self._redraw()
 
     def scroll(self, delta):
-        """Dışarıdan çağrılabilir scroll (global handler için)."""
         self._canvas.yview_scroll(int(-delta), "units")
         self._redraw()
-
-    # ─── PUBLIC API ──────────────────────────────────────────────────────────
 
     def set_items(self, items):
         self._items = items
@@ -120,10 +110,8 @@ class VirtualListbox(ctk.CTkFrame):
         self._canvas.update_idletasks()
         w = self._canvas.winfo_width() or 600
         h = self._canvas.winfo_height() or 400
-        self._canvas.create_text(
-            w // 2, h // 2, text=text,
-            fill=COLOR_EMPTY_TEXT, font=("Helvetica", 14), anchor="center"
-        )
+        self._canvas.create_text(w // 2, h // 2, text=text,
+            fill=COLOR_EMPTY_TEXT, font=("Helvetica", 14), anchor="center")
 
     def get_selected_items(self):
         return [self._items[i] for i in sorted(self._selected) if i < len(self._items)]
@@ -149,8 +137,6 @@ class VirtualListbox(ctk.CTkFrame):
             return x <= x_root <= x + w and y <= y_root <= y + h
         except Exception:
             return False
-
-    # ─── EVENTS ──────────────────────────────────────────────────────────────
 
     def _on_mousewheel(self, event):
         if IS_MAC:
@@ -202,12 +188,9 @@ class VirtualListbox(ctk.CTkFrame):
         self._redraw()
 
     def _canvas_y_to_index(self, canvas_y):
-        """Canvas widget koordinatını (scroll dahil) liste indeksine çevirir."""
         abs_y = self._canvas.canvasy(canvas_y)
         idx = int(abs_y // self._row_height)
         return idx if 0 <= idx < len(self._items) else None
-
-    # ─── RENDER ──────────────────────────────────────────────────────────────
 
     def _redraw(self):
         self._canvas.delete("all")
@@ -217,11 +200,8 @@ class VirtualListbox(ctk.CTkFrame):
         w = self._canvas.winfo_width() or 800
         h = self._canvas.winfo_height() or 600
         total_h = len(self._items) * self._row_height
-
-        # scrollregion'ı güncelle
         self._canvas.configure(scrollregion=(0, 0, w, total_h))
 
-        # Görünür aralığı hesapla
         scroll_top = self._canvas.canvasy(0)
         scroll_bot = self._canvas.canvasy(h)
         first = max(0, int(scroll_top // self._row_height))
@@ -242,17 +222,12 @@ class VirtualListbox(ctk.CTkFrame):
                 bg = COLOR_ROW_ODD
 
             self._canvas.create_rectangle(0, y0, w, y1, fill=bg, outline="")
-
-            self._canvas.create_text(
-                12, y0 + self._row_height // 2,
+            self._canvas.create_text(12, y0 + self._row_height // 2,
                 text=os.path.splitext(rom["name"])[0],
-                anchor="w", fill=COLOR_TEXT, font=("Helvetica", FONT_SIZE),
-            )
-            self._canvas.create_text(
-                w - 12, y0 + self._row_height // 2,
+                anchor="w", fill=COLOR_TEXT, font=("Helvetica", FONT_SIZE))
+            self._canvas.create_text(w - 12, y0 + self._row_height // 2,
                 text=format_size(rom["size"]),
-                anchor="e", fill=COLOR_TEXT_DIM, font=("Helvetica", 11),
-            )
+                anchor="e", fill=COLOR_TEXT_DIM, font=("Helvetica", 11))
 
 
 class MainWindow(ctk.CTk):
@@ -273,6 +248,7 @@ class MainWindow(ctk.CTk):
 
         self._build_ui()
         self._setup_global_scroll()
+        self.toast = ToastManager(self)
         self._scan_drives()
 
     # ─── GLOBAL SCROLL ───────────────────────────────────────────────────────
@@ -480,13 +456,18 @@ class MainWindow(ctk.CTk):
         if not drives:
             self.drive_menu.configure(values=["EmuELEC cihazı bulunamadı"])
             self.drive_var.set("EmuELEC cihazı bulunamadı")
-            self._set_status("Hiçbir EmuELEC cihazı bulunamadı. SD kartı taktınız mı?")
+            self._set_status("Hiçbir EmuELEC cihazı bulunamadı.")
+            self.toast.warning("SD kart takılı değil veya EmuELEC cihazı bulunamadı.")
             return
 
         labels = [self._drive_display_name(d) for d in drives]
         self.drive_menu.configure(values=labels)
         self.drive_var.set(labels[0])
         self._on_drive_selected(labels[0])
+
+        label = drives[0].get("label") or "SD Kart"
+        count = len(drives[0]["emuelec"]["systems"])
+        self.toast.success(f"{label} bağlandı — {count} sistem bulundu")
 
     def _drive_display_name(self, drive):
         label = drive.get("label") or "SD Kart"
@@ -598,29 +579,58 @@ class MainWindow(ctk.CTk):
         self.add_btn.configure(state="disabled")
         self._show_progress()
 
+        # conflict_callback UI thread'inde çalışmalı — Event ile senkronize ediyoruz
+        def conflict_callback(filename, remaining):
+            result_holder = [None]
+            event = threading.Event()
+
+            def show_dialog():
+                dlg = OverwriteDialog(self, filename, remaining)
+                result_holder[0] = dlg.result
+                event.set()
+
+            self.after(0, show_dialog)
+            event.wait()  # Dialog kapanana kadar thread burada bekler
+            return result_holder[0]
+
         threading.Thread(
             target=self._add_roms_thread,
-            args=(list(paths), dest),
+            args=(list(paths), dest, conflict_callback),
             daemon=True
         ).start()
 
-    def _add_roms_thread(self, paths, dest):
-        results = add_roms(paths, dest)
+    def _add_roms_thread(self, paths, dest, conflict_callback):
+        results = add_roms(paths, dest, conflict_callback=conflict_callback)
         self.after(0, lambda: self._on_add_complete(results))
 
     def _on_add_complete(self, results):
         self._hide_progress()
         self.add_btn.configure(state="normal")
 
-        parts = []
-        if results["success"]:
-            parts.append(f"{len(results['success'])} ROM eklendi")
-        if results["skipped"]:
-            parts.append(f"{len(results['skipped'])} zaten vardı")
-        if results["failed"]:
-            parts.append(f"{len(results['failed'])} başarısız")
+        ok   = len(results["success"])
+        skip = len(results["skipped"])
+        fail = len(results["failed"])
+        cancelled = results.get("cancelled", False)
 
+        parts = []
+        if ok:   parts.append(f"{ok} eklendi")
+        if skip: parts.append(f"{skip} atlandı")
+        if fail: parts.append(f"{fail} başarısız")
+        if cancelled: parts.append("iptal edildi")
         self._set_status(" · ".join(parts) if parts else "İşlem tamamlandı")
+
+        if cancelled:
+            self.toast.info("Kopyalama iptal edildi")
+        elif fail == 0 and ok > 0:
+            msg = f"{ok} ROM eklendi"
+            if skip: msg += f"  ({skip} atlandı)"
+            self.toast.success(msg)
+        elif ok == 0 and fail == 0:
+            self.toast.info(f"{skip} ROM zaten mevcut, atlandı")
+        elif fail > 0 and ok == 0:
+            self.toast.error(f"{fail} ROM eklenemedi")
+        else:
+            self.toast.warning(f"{ok} eklendi · {fail} başarısız")
 
         if self.current_system:
             self._on_system_selected(self.current_system)
@@ -669,13 +679,20 @@ class MainWindow(ctk.CTk):
     def _on_delete_complete(self, results):
         self._hide_progress()
 
-        parts = []
-        if results["success"]:
-            parts.append(f"{len(results['success'])} oyun silindi")
-        if results["failed"]:
-            parts.append(f"{len(results['failed'])} silinemedi")
+        ok   = len(results["success"])
+        fail = len(results["failed"])
 
+        parts = []
+        if ok:   parts.append(f"{ok} silindi")
+        if fail: parts.append(f"{fail} silinemedi")
         self._set_status(" · ".join(parts) if parts else "İşlem tamamlandı")
+
+        if fail == 0:
+            self.toast.success(f"{ok} oyun silindi")
+        elif ok == 0:
+            self.toast.error(f"{fail} oyun silinemedi")
+        else:
+            self.toast.warning(f"{ok} silindi · {fail} silinemedi")
 
         if self.current_system:
             self._on_system_selected(self.current_system)

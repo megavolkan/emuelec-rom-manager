@@ -71,25 +71,34 @@ def build_file_dialog_filter(system_name):
     ]
 
 
-# ─── APPLE DOUBLE TEMİZLİĞİ ──────────────────────────────────────────────────
+def _is_valid_rom_source(path):
+    """macOS Apple Double (._) ve gizli dosyaları reddeder."""
+    filename = os.path.basename(path)
+    return not (filename.startswith("._") or filename.startswith("."))
+
+
+def _copy_file(src, dest):
+    """
+    Dosyayı kopyalar. shutil.copyfile kullanır — sadece içerik kopyalar,
+    metadata kopyalamaz. Bu sayede FAT32'deki özel karakter sorunu çözülür.
+    shutil.copy2'nin metadata kopyalama adımı FAT32 üzerinde tek tırnak
+    gibi karakterlerde [Errno 22] hatasına yol açar.
+    """
+    shutil.copyfile(src, dest)
+
+
+# ─── APPLE DOUBLE ─────────────────────────────────────────────────────────────
 
 def remove_apple_double(rom_path):
-    """
-    ROM dosyasıyla aynı klasörde olan ._<romadı> dosyasını siler.
-    Örneğin: Super Mario World (USA).zip → ._Super Mario World (USA).zip
-    Dosya yoksa sessizce geçer.
-    """
-    rom_dir = os.path.dirname(rom_path)
-    rom_filename = os.path.basename(rom_path)
-    apple_double_path = os.path.join(rom_dir, f"._{rom_filename}")
-
-    if os.path.isfile(apple_double_path):
+    apple_double = os.path.join(
+        os.path.dirname(rom_path),
+        f"._{os.path.basename(rom_path)}"
+    )
+    if os.path.isfile(apple_double):
         try:
-            os.remove(apple_double_path)
-            return True
+            os.remove(apple_double)
         except Exception:
-            return False
-    return True  # Yoksa sorun değil
+            pass
 
 
 # ─── GAMELIST XML ─────────────────────────────────────────────────────────────
@@ -143,23 +152,62 @@ def remove_media_files(rom_path, system_path):
 
 # ─── EKLEME ──────────────────────────────────────────────────────────────────
 
-def add_roms(source_paths, dest_system_path, progress_callback=None):
-    results = {"success": [], "failed": [], "skipped": []}
-    total = len(source_paths)
+def add_roms(source_paths, dest_system_path, conflict_callback=None):
+    """
+    ROM dosyalarını hedef sistem klasörüne kopyalar.
+    - macOS gizli dosyaları (._*, .*) atlanır
+    - shutil.copyfile kullanılır (metadata kopyalamaz, FAT32 uyumlu)
 
-    for i, src in enumerate(source_paths):
+    Returns:
+        {"success": [...], "failed": [...], "skipped": [...], "cancelled": bool}
+    """
+    results = {"success": [], "failed": [], "skipped": [], "cancelled": False}
+
+    valid_paths = [p for p in source_paths if _is_valid_rom_source(p)]
+
+    conflicts = [
+        p for p in valid_paths
+        if os.path.exists(os.path.join(dest_system_path, os.path.basename(p)))
+    ]
+    conflict_set = set(conflicts)
+    bulk_action = None
+
+    for src in valid_paths:
         filename = os.path.basename(src)
         dest = os.path.join(dest_system_path, filename)
 
-        if progress_callback:
-            progress_callback(i + 1, total, filename)
+        if src in conflict_set:
+            if bulk_action == "overwrite_all":
+                action = "overwrite"
+            elif bulk_action == "skip_all":
+                action = "skip"
+            elif conflict_callback:
+                remaining = len([p for p in conflicts if p != src and p not in results["success"]])
+                action = conflict_callback(filename, remaining)
+                if action == "overwrite_all":
+                    bulk_action = "overwrite_all"
+                    action = "overwrite"
+                elif action == "skip_all":
+                    bulk_action = "skip_all"
+                    action = "skip"
+                elif action == "cancel":
+                    results["cancelled"] = True
+                    break
+            else:
+                action = "skip"
 
-        if os.path.exists(dest):
-            results["skipped"].append(filename)
-            continue
+            if action == "skip":
+                results["skipped"].append(filename)
+                continue
+
+            try:
+                os.remove(dest)
+            except Exception as e:
+                results["failed"].append({"file": filename, "error": str(e)})
+                continue
 
         try:
-            shutil.copy2(src, dest)
+            _copy_file(src, dest)
             results["success"].append(filename)
         except Exception as e:
             results["failed"].append({"file": filename, "error": str(e)})
@@ -172,8 +220,8 @@ def add_roms(source_paths, dest_system_path, progress_callback=None):
 def delete_games(roms, system_path, progress_callback=None):
     """
     Bir oyunu tüm bileşenleriyle siler:
-      1. Apple Double dosyası (._romadı) — varsa
-      2. Media dosyaları (resim, video, screenshot...)
+      1. Apple Double (._) dosyası
+      2. Media dosyaları
       3. gamelist.xml kaydı
       4. ROM dosyası
     """
@@ -189,19 +237,15 @@ def delete_games(roms, system_path, progress_callback=None):
 
         errors = []
 
-        # 1. Apple Double (._) dosyası
-        remove_apple_double(rom_path)  # Hata olsa bile devam et
+        remove_apple_double(rom_path)
 
-        # 2. Media dosyaları
         media_result = remove_media_files(rom_path, system_path)
         if media_result["failed"]:
             errors.append(f"media: {len(media_result['failed'])} silinemedi")
 
-        # 3. gamelist.xml kaydı
         if not remove_from_gamelist(rom_path, system_path):
             errors.append("gamelist.xml güncellenemedi")
 
-        # 4. ROM dosyası
         try:
             os.remove(rom_path)
             if errors:

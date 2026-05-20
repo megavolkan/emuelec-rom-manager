@@ -19,8 +19,26 @@ EMUELEC_SYSTEM_DIRS = {
     "x68000", "zxspectrum"
 }
 
-# Minimum kaç EmuELEC klasörü bulunursa "cihaz" sayılır
 MIN_SYSTEM_MATCH = 2
+
+# macOS'un otomatik oluşturduğu gizli dosyalar — ROM listesinde gösterilmez
+IGNORED_FILENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def _is_rom_file(filename):
+    """
+    Bir dosyanın ROM olup olmadığını kontrol eder.
+    macOS Apple Double (._) dosyaları ve sistem dosyaları hariç tutulur.
+    """
+    if filename.startswith("._"):
+        return False
+    if filename.startswith("."):
+        return False
+    if filename.lower() in IGNORED_FILENAMES:
+        return False
+    if filename.lower() == "gamelist.xml":
+        return False
+    return True
 
 
 def get_mounted_drives():
@@ -29,9 +47,6 @@ def get_mounted_drives():
     partitions = psutil.disk_partitions(all=False)
 
     for p in partitions:
-        # macOS: /Volumes/... altındaki harici sürücüler
-        # Windows: D:\, E:\ gibi sürücüler
-        # Linux: /media/... veya /mnt/... altındaki mount noktaları
         if _is_external_drive(p):
             try:
                 usage = psutil.disk_usage(p.mountpoint)
@@ -50,18 +65,14 @@ def get_mounted_drives():
 
 
 def _is_external_drive(partition):
-    """Bir partition'ın harici/çıkarılabilir sürücü olup olmadığını kontrol eder."""
     mp = partition.mountpoint
     system = platform.system()
 
-    if system == "Darwin":  # macOS
+    if system == "Darwin":
         return mp.startswith("/Volumes/") and mp != "/Volumes"
-
     elif system == "Windows":
-        # A: ve B: disket sürücüleri hariç
         drive_letter = mp[0].upper() if mp else ""
         return drive_letter not in ("A", "B", "C")
-
     elif system == "Linux":
         return mp.startswith(("/media/", "/mnt/", "/run/media/"))
 
@@ -69,13 +80,10 @@ def _is_external_drive(partition):
 
 
 def _get_drive_label(mountpoint):
-    """Sürücünün etiketini (ismini) döndürür."""
     system = platform.system()
 
     if system == "Darwin":
-        # /Volumes/SD_KART → "SD_KART"
         return os.path.basename(mountpoint)
-
     elif system == "Windows":
         try:
             import ctypes
@@ -87,21 +95,15 @@ def _get_drive_label(mountpoint):
             return volume_name.value or os.path.basename(mountpoint)
         except Exception:
             return mountpoint
-
-    else:  # Linux
+    else:
         return os.path.basename(mountpoint)
 
 
 def detect_emuelec_drives(drives=None):
-    """
-    Verilen sürücü listesinden EmuELEC yapısına sahip olanları tespit eder.
-    drives parametresi None ise get_mounted_drives() çağrılır.
-    """
     if drives is None:
         drives = get_mounted_drives()
 
     emuelec_drives = []
-
     for drive in drives:
         result = check_emuelec_structure(drive["mountpoint"])
         if result["is_emuelec"]:
@@ -112,10 +114,6 @@ def detect_emuelec_drives(drives=None):
 
 
 def check_emuelec_structure(mountpoint):
-    """
-    Bir mountpoint'in EmuELEC yapısına sahip olup olmadığını kontrol eder.
-    Kök dizindeki klasörleri EMUELEC_SYSTEM_DIRS ile karşılaştırır.
-    """
     try:
         entries = os.listdir(mountpoint)
     except (PermissionError, OSError):
@@ -141,7 +139,7 @@ def check_emuelec_structure(mountpoint):
 def get_system_roms(games_path, system_name):
     """
     Belirtilen sistem klasöründeki ROM dosyalarını listeler.
-    gamelist.xml ve media klasörü hariç tutulur.
+    macOS gizli dosyaları (._*, .DS_Store) ve gamelist.xml hariç tutulur.
     """
     system_path = os.path.join(games_path, system_name)
 
@@ -151,8 +149,10 @@ def get_system_roms(games_path, system_name):
     roms = []
     try:
         for entry in os.listdir(system_path):
+            if not _is_rom_file(entry):
+                continue
             full_path = os.path.join(system_path, entry)
-            if os.path.isfile(full_path) and entry.lower() != "gamelist.xml":
+            if os.path.isfile(full_path):
                 roms.append({
                     "name": entry,
                     "path": full_path,

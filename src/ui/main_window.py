@@ -4,10 +4,11 @@ Ana uygulama penceresi — Aşama 3
 """
 
 import os
+import subprocess
 import threading
 import platform
 import customtkinter as ctk
-from tkinter import Canvas, filedialog, messagebox
+from tkinter import Canvas, filedialog, messagebox, Menu
 
 from src.core.drive_detector import (
     detect_emuelec_drives,
@@ -68,6 +69,7 @@ class VirtualListbox(ctk.CTkFrame):
         self._hover_idx = None
         self._row_height = ROW_HEIGHT
         self._on_selection_change = on_selection_change
+        self._on_context_menu = None   # (roms, x_root, y_root) -> None
         self._has_metadata = set()
 
         self._canvas = Canvas(self, bg=COLOR_BG, bd=0, highlightthickness=0, relief="flat")
@@ -80,6 +82,8 @@ class VirtualListbox(ctk.CTkFrame):
         self._canvas.bind("<Configure>", self._on_resize)
         self._canvas.bind("<MouseWheel>", self._on_mousewheel)
         self._canvas.bind("<Button-1>", self._on_click)
+        self._canvas.bind("<Button-2>", self._on_right_click)   # macOS sağ tık
+        self._canvas.bind("<Button-3>", self._on_right_click)   # Windows/Linux sağ tık
         self._canvas.bind("<Motion>", self._on_hover)
         self._canvas.bind("<Leave>", self._on_leave)
 
@@ -191,6 +195,29 @@ class VirtualListbox(ctk.CTkFrame):
         if idx != self._hover_idx:
             self._hover_idx = idx
             self._redraw()
+
+    def _on_right_click(self, event):
+        """Sağ tık — ilgili ROM'u seç ve context menu göster."""
+        if not self._items:
+            return
+        idx = self._canvas_y_to_index(event.y)
+        if idx is None or idx >= len(self._items):
+            return
+
+        # Sağ tıklanan ROM seçili değilse seçimi sıfırla
+        if idx not in self._selected:
+            self._selected = {idx}
+            self._last_clicked = idx
+            self._redraw()
+            if self._on_selection_change:
+                self._on_selection_change(self.get_selected_items())
+
+        if self._on_context_menu:
+            self._on_context_menu(
+                self.get_selected_items(),
+                event.x_root,
+                event.y_root,
+            )
 
     def _on_leave(self, event):
         self._hover_idx = None
@@ -413,6 +440,7 @@ class MainWindow(ctk.CTk):
         )
         self.rom_list.grid(row=1, column=0, sticky="nsew")
         self.rom_list.show_message("← Soldan bir sistem seçin")
+        self.rom_list._on_context_menu = self._show_context_menu
 
     def _build_toolbar(self):
         toolbar = ctk.CTkFrame(self, height=52, corner_radius=0, fg_color=("gray83", "gray18"))
@@ -465,6 +493,82 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"),
         )
         self.rom_count_label.pack(side="right", padx=12, pady=6)
+
+    # ─── CONTEXT MENU ────────────────────────────────────────────────────────
+
+    CONTEXT_MENU_ITEMS = [
+        {"label": "🔍  Scrape",             "action": "scrape",    "multi": True},
+        {"label": "✏️  Metadata Düzenle",    "action": "edit_meta", "multi": False},
+        {"separator": True},
+        {"label": "📂  Dosya Konumunu Aç",  "action": "reveal",    "multi": False},
+        {"separator": True},
+        {"label": "🗑  Oyunu Sil",          "action": "delete",    "multi": True, "destructive": True},
+    ]
+
+    def _show_context_menu(self, roms, x_root, y_root):
+        if not roms:
+            return
+
+        is_multi = len(roms) > 1
+        menu = Menu(self, tearoff=0)
+
+        for item in self.CONTEXT_MENU_ITEMS:
+            if item.get("separator"):
+                menu.add_separator()
+                continue
+            if is_multi and not item.get("multi", True):
+                continue
+
+            action = item["action"]
+            label  = item["label"]
+            cmd = lambda a=action, r=roms: self._on_context_action(a, r)
+            kwargs = {"label": label, "command": cmd}
+            if item.get("destructive"):
+                kwargs["foreground"] = "red"
+            menu.add_command(**kwargs)
+
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_context_action(self, action: str, roms: list):
+        if action == "scrape":
+            self._start_scrape(roms)
+
+        elif action == "delete":
+            self._selected_roms = roms
+            self._on_delete_roms()
+
+        elif action == "reveal":
+            if roms:
+                self._reveal_in_finder(roms[0]["path"])
+
+        elif action == "edit_meta":
+            if roms:
+                self._open_metadata_editor(roms[0])
+
+    def _reveal_in_finder(self, path: str):
+        try:
+            if platform.system() == "Darwin":
+                subprocess.run(["open", "-R", path])
+            elif platform.system() == "Windows":
+                subprocess.run(["explorer", "/select,", path])
+            else:
+                subprocess.run(["xdg-open", os.path.dirname(path)])
+        except Exception as e:
+            self.toast.error(f"Dosya konumu açılamadı: {e}")
+
+    def _open_metadata_editor(self, rom: dict):
+        from src.ui.metadata_editor import MetadataEditor
+        system_path = os.path.join(
+            self.current_drive["emuelec"]["games_path"],
+            self.current_system
+        )
+        MetadataEditor(
+            self, rom, system_path,
+            on_save=lambda: self._on_system_selected(self.current_system)
+        )
 
     # ─── SETTINGS ────────────────────────────────────────────────────────────
 

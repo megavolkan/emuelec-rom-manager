@@ -1,6 +1,6 @@
 """
 main_window.py
-Ana uygulama penceresi — Aşama 2
+Ana uygulama penceresi — Aşama 3
 """
 
 import os
@@ -15,8 +15,12 @@ from src.core.drive_detector import (
     format_size,
 )
 from src.core.rom_manager import add_roms, delete_games, build_file_dialog_filter
+from src.core.gamelist import write_game_entry, get_game_metadata
+from src.core.scraper import IGDBScraper, ScraperError
+from src.core import config
 from src.ui.toast import ToastManager
 from src.ui.dialogs import OverwriteDialog
+from src.ui.settings_window import SettingsWindow
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -49,6 +53,7 @@ COLOR_TEXT         = "#e0e0e0"
 COLOR_TEXT_DIM     = "#888888"
 COLOR_EMPTY_TEXT   = "#666666"
 COLOR_BG           = "#1a1a1a"
+COLOR_HAS_META     = "#2a5c2a"
 
 
 class VirtualListbox(ctk.CTkFrame):
@@ -63,6 +68,7 @@ class VirtualListbox(ctk.CTkFrame):
         self._hover_idx = None
         self._row_height = ROW_HEIGHT
         self._on_selection_change = on_selection_change
+        self._has_metadata = set()
 
         self._canvas = Canvas(self, bg=COLOR_BG, bd=0, highlightthickness=0, relief="flat")
         self._canvas.grid(row=0, column=0, sticky="nsew")
@@ -90,16 +96,22 @@ class VirtualListbox(ctk.CTkFrame):
         self._selected = set()
         self._last_clicked = None
         self._hover_idx = None
+        self._has_metadata = set()
         self._canvas.yview_moveto(0)
         self._redraw()
         if self._on_selection_change:
             self._on_selection_change([])
+
+    def set_metadata_indices(self, indices: set):
+        self._has_metadata = indices
+        self._redraw()
 
     def clear(self):
         self._items = []
         self._selected = set()
         self._last_clicked = None
         self._hover_idx = None
+        self._has_metadata = set()
         self._canvas.delete("all")
         self._canvas.configure(scrollregion=(0, 0, 0, 0))
         if self._on_selection_change:
@@ -216,6 +228,8 @@ class VirtualListbox(ctk.CTkFrame):
                 bg = COLOR_ROW_SELECTED
             elif i == self._hover_idx:
                 bg = COLOR_ROW_HOVER
+            elif i in self._has_metadata:
+                bg = COLOR_HAS_META
             elif i % 2 == 0:
                 bg = COLOR_ROW_EVEN
             else:
@@ -245,6 +259,7 @@ class MainWindow(ctk.CTk):
         self.emuelec_drives = []
         self._loading_system = None
         self._selected_roms = []
+        self._gamelist_cache = {}
 
         self._build_ui()
         self._setup_global_scroll()
@@ -323,6 +338,13 @@ class MainWindow(ctk.CTk):
             command=self._scan_drives, font=ctk.CTkFont(size=13),
         )
         self.refresh_btn.pack(side="left", padx=(10, 0))
+
+        ctk.CTkButton(
+            drive_frame, text="⚙", width=36, height=36,
+            font=ctk.CTkFont(size=16),
+            fg_color="transparent", border_width=1,
+            command=self._open_settings,
+        ).pack(side="left", padx=(10, 0))
 
     def _build_left_panel(self):
         self.left_panel = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color=("gray90", "gray17"))
@@ -410,7 +432,15 @@ class MainWindow(ctk.CTk):
             fg_color="#8b1a1a", hover_color="#a02020",
             command=self._on_delete_roms, state="disabled",
         )
-        self.delete_btn.pack(side="left", padx=(0, 12), pady=8)
+        self.delete_btn.pack(side="left", padx=(0, 8), pady=8)
+
+        self.scrape_btn = ctk.CTkButton(
+            toolbar, text="🔍  Scrape",
+            width=110, height=36, font=ctk.CTkFont(size=13),
+            fg_color="#1a4a7a", hover_color="#1a5a9a",
+            command=self._on_scrape_selected, state="disabled",
+        )
+        self.scrape_btn.pack(side="left", padx=(0, 12), pady=8)
 
         self.selection_label = ctk.CTkLabel(
             toolbar, text="",
@@ -435,6 +465,11 @@ class MainWindow(ctk.CTk):
             font=ctk.CTkFont(size=11), text_color=("gray40", "gray60"),
         )
         self.rom_count_label.pack(side="right", padx=12, pady=6)
+
+    # ─── SETTINGS ────────────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        SettingsWindow(self)
 
     # ─── DRIVE SCAN ──────────────────────────────────────────────────────────
 
@@ -491,6 +526,7 @@ class MainWindow(ctk.CTk):
         self.filtered_roms = []
         self._loading_system = None
         self._selected_roms = []
+        self._gamelist_cache = {}
 
         self._populate_systems(self.current_drive["emuelec"]["systems"])
         self.rom_list.clear()
@@ -526,17 +562,30 @@ class MainWindow(ctk.CTk):
         ).start()
 
     def _load_roms_thread(self, system_name, games_path):
+        from src.core.gamelist import read_gamelist
         roms = get_system_roms(games_path, system_name)
-        self.after(0, lambda: self._on_roms_loaded(system_name, roms))
+        system_path = os.path.join(games_path, system_name)
+        gamelist = read_gamelist(system_path)
+        self.after(0, lambda: self._on_roms_loaded(system_name, roms, gamelist))
 
-    def _on_roms_loaded(self, system_name, roms):
+    def _on_roms_loaded(self, system_name, roms, gamelist):
         if self._loading_system != system_name:
             return
         self._hide_progress()
         self.all_roms = roms
+
+        system_path = os.path.join(
+            self.current_drive["emuelec"]["games_path"], system_name
+        )
+        self._gamelist_cache[system_path] = gamelist
         self._apply_filter()
+
         system_label = SYSTEM_LABELS.get(system_name, system_name.upper())
-        self._set_status(f"{system_label} — {len(roms)} ROM")
+        meta_count = sum(
+            1 for r in roms
+            if os.path.splitext(r["name"])[0].lower() in gamelist
+        )
+        self._set_status(f"{system_label} — {len(roms)} ROM  ·  {meta_count} metadata")
 
     def _on_search_changed(self, *args):
         self._apply_filter()
@@ -579,18 +628,15 @@ class MainWindow(ctk.CTk):
         self.add_btn.configure(state="disabled")
         self._show_progress()
 
-        # conflict_callback UI thread'inde çalışmalı — Event ile senkronize ediyoruz
         def conflict_callback(filename, remaining):
             result_holder = [None]
             event = threading.Event()
-
             def show_dialog():
                 dlg = OverwriteDialog(self, filename, remaining)
                 result_holder[0] = dlg.result
                 event.set()
-
             self.after(0, show_dialog)
-            event.wait()  # Dialog kapanana kadar thread burada bekler
+            event.wait()
             return result_holder[0]
 
         threading.Thread(
@@ -601,9 +647,9 @@ class MainWindow(ctk.CTk):
 
     def _add_roms_thread(self, paths, dest, conflict_callback):
         results = add_roms(paths, dest, conflict_callback=conflict_callback)
-        self.after(0, lambda: self._on_add_complete(results))
+        self.after(0, lambda: self._on_add_complete(results, paths))
 
-    def _on_add_complete(self, results):
+    def _on_add_complete(self, results, original_paths):
         self._hide_progress()
         self.add_btn.configure(state="normal")
 
@@ -613,9 +659,9 @@ class MainWindow(ctk.CTk):
         cancelled = results.get("cancelled", False)
 
         parts = []
-        if ok:   parts.append(f"{ok} eklendi")
-        if skip: parts.append(f"{skip} atlandı")
-        if fail: parts.append(f"{fail} başarısız")
+        if ok:        parts.append(f"{ok} eklendi")
+        if skip:      parts.append(f"{skip} atlandı")
+        if fail:      parts.append(f"{fail} başarısız")
         if cancelled: parts.append("iptal edildi")
         self._set_status(" · ".join(parts) if parts else "İşlem tamamlandı")
 
@@ -634,6 +680,19 @@ class MainWindow(ctk.CTk):
 
         if self.current_system:
             self._on_system_selected(self.current_system)
+
+        # Otomatik scrape
+        if ok > 0 and config.get("auto_scrape", True):
+            cfg = config.load()
+            if cfg.get("igdb_client_id") and cfg.get("igdb_client_secret"):
+                added_files = results["success"]
+                roms_to_scrape = [
+                    {"name": f, "path": os.path.join(dest, f)}
+                    for f in added_files
+                ]
+                self.after(500, lambda: self._start_scrape(roms_to_scrape, silent=True))
+            else:
+                self.toast.info("Otomatik scrape için Ayarlar'dan IGDB bilgilerini girin.")
 
     # ─── ROM SİL ─────────────────────────────────────────────────────────────
 
@@ -697,6 +756,105 @@ class MainWindow(ctk.CTk):
         if self.current_system:
             self._on_system_selected(self.current_system)
 
+    # ─── SCRAPE ──────────────────────────────────────────────────────────────
+
+    def _on_scrape_selected(self):
+        if not self._selected_roms:
+            return
+
+        cfg = config.load()
+        if not cfg.get("igdb_client_id") or not cfg.get("igdb_client_secret"):
+            self.toast.warning("IGDB bilgileri eksik. Ayarlar'dan girin.")
+            self._open_settings()
+            return
+
+        self._start_scrape(self._selected_roms)
+
+    def _start_scrape(self, roms: list, silent: bool = False):
+        if not roms:
+            return
+
+        cfg = config.load()
+        system_path = os.path.join(
+            self.current_drive["emuelec"]["games_path"],
+            self.current_system
+        )
+
+        self._set_status(f"{len(roms)} ROM için metadata çekiliyor...")
+        self._show_progress()
+
+        threading.Thread(
+            target=self._scrape_thread,
+            args=(roms, system_path, cfg, silent),
+            daemon=True
+        ).start()
+
+    def _scrape_thread(self, roms, system_path, cfg, silent):
+        scraper = IGDBScraper(
+            client_id=cfg["igdb_client_id"],
+            client_secret=cfg["igdb_client_secret"],
+        )
+
+        results = {"success": [], "not_found": [], "failed": []}
+
+        for rom in roms:
+            rom_path = rom["path"]
+            filename = rom["name"]
+
+            try:
+                result = scraper.scrape_rom(rom_path, self.current_system)
+                metadata = result.to_gamelist_dict()
+
+                # Kapak resmini indir
+                image_rel_path = None
+                cover_id = result.cover_image_id
+                if cover_id:
+                    stem = os.path.splitext(filename)[0]
+                    img_filename = f"{stem}.jpg"
+                    img_dest = os.path.join(system_path, "images", img_filename)
+                    if scraper.download_image(cover_id, img_dest):
+                        image_rel_path = f"./images/{img_filename}"
+
+                write_game_entry(system_path, filename, metadata, image_rel_path)
+                results["success"].append(filename)
+
+            except ScraperError as e:
+                err_str = str(e)
+                if "bulunamadı" in err_str.lower():
+                    results["not_found"].append(filename)
+                else:
+                    results["failed"].append({"file": filename, "error": err_str})
+            except Exception as e:
+                results["failed"].append({"file": filename, "error": str(e)})
+
+        self.after(0, lambda: self._on_scrape_complete(results, silent))
+
+    def _on_scrape_complete(self, results, silent):
+        self._hide_progress()
+
+        ok        = len(results["success"])
+        not_found = len(results["not_found"])
+        fail      = len(results["failed"])
+
+        parts = []
+        if ok:        parts.append(f"{ok} metadata çekildi")
+        if not_found: parts.append(f"{not_found} bulunamadı")
+        if fail:      parts.append(f"{fail} hata")
+        self._set_status(" · ".join(parts) if parts else "Scrape tamamlandı")
+
+        if not silent or fail > 0:
+            if ok > 0 and fail == 0:
+                self.toast.success(f"{ok} ROM için metadata çekildi")
+            elif ok > 0 and fail > 0:
+                self.toast.warning(f"{ok} başarılı · {fail} hatalı")
+            elif ok == 0 and not_found > 0:
+                self.toast.info("Hiçbir ROM veritabanında bulunamadı")
+            if fail > 0:
+                self.toast.error(f"Hata: {results['failed'][0]['error']}")
+
+        if self.current_system:
+            self._on_system_selected(self.current_system)
+
     # ─── POPULATE ────────────────────────────────────────────────────────────
 
     def _populate_systems(self, systems):
@@ -734,14 +892,28 @@ class MainWindow(ctk.CTk):
         self.rom_count_label.configure(text=f"{system_label} — {len(roms)} ROM")
         self.rom_list.set_items(roms)
 
+        system_path = os.path.join(
+            self.current_drive["emuelec"]["games_path"],
+            self.current_system
+        ) if self.current_drive and self.current_system else None
+
+        if system_path and system_path in self._gamelist_cache:
+            gamelist = self._gamelist_cache[system_path]
+            meta_indices = {
+                i for i, r in enumerate(roms)
+                if os.path.splitext(r["name"])[0].lower() in gamelist
+            }
+            self.rom_list.set_metadata_indices(meta_indices)
+
     # ─── TOOLBAR ─────────────────────────────────────────────────────────────
 
     def _update_toolbar(self):
-        has_system = self.current_system is not None
+        has_system    = self.current_system is not None
         has_selection = len(self._selected_roms) > 0
 
         self.add_btn.configure(state="normal" if has_system else "disabled")
         self.delete_btn.configure(state="normal" if has_selection else "disabled")
+        self.scrape_btn.configure(state="normal" if has_selection else "disabled")
 
         if has_selection:
             self.selection_label.configure(text=f"{len(self._selected_roms)} oyun seçili")

@@ -2,6 +2,12 @@
 rom_manager.py
 ROM ekleme, silme ve dosya işlemleri.
 Bir ROM = dosya + Apple Double (._) + media + gamelist.xml kaydı
+
+EmuELEC media yapısı:
+  snes/images/     (media/ ara klasörü YOK)
+  snes/videos/
+  snes/screenshots/
+  vb.
 """
 
 import os
@@ -52,6 +58,8 @@ ROM_EXTENSIONS = {
 
 DEFAULT_EXTENSIONS = [".zip", ".7z", ".bin", ".iso"]
 
+# EmuELEC media klasörleri — sistem klasörünün direkt altında (media/ ara klasörü yok)
+# Örnek: /Volumes/SD/snes/images/, /Volumes/SD/snes/videos/
 MEDIA_SUBDIRS = [
     "images", "videos", "screenshots", "thumbnails",
     "marquees", "wheels", "fanart", "boxart",
@@ -72,18 +80,11 @@ def build_file_dialog_filter(system_name):
 
 
 def _is_valid_rom_source(path):
-    """macOS Apple Double (._) ve gizli dosyaları reddeder."""
     filename = os.path.basename(path)
     return not (filename.startswith("._") or filename.startswith("."))
 
 
 def _copy_file(src, dest):
-    """
-    Dosyayı kopyalar. shutil.copyfile kullanır — sadece içerik kopyalar,
-    metadata kopyalamaz. Bu sayede FAT32'deki özel karakter sorunu çözülür.
-    shutil.copy2'nin metadata kopyalama adımı FAT32 üzerinde tek tırnak
-    gibi karakterlerde [Errno 22] hatasına yol açar.
-    """
     shutil.copyfile(src, dest)
 
 
@@ -130,12 +131,17 @@ def remove_from_gamelist(rom_path, system_path):
 
 
 def remove_media_files(rom_path, system_path):
+    """
+    ROM'a ait media dosyalarını siler.
+    EmuELEC yapısı: system_path/images/, system_path/videos/ vb.
+    (media/ ara klasörü olmadan direkt sistem klasörünün altında)
+    """
     stem = os.path.splitext(os.path.basename(rom_path))[0].lower()
     results = {"deleted": [], "failed": []}
 
-    media_root = os.path.join(system_path, "media")
     for subdir in MEDIA_SUBDIRS:
-        subdir_path = os.path.join(media_root, subdir)
+        # Doğrudan sistem klasörü altında ara
+        subdir_path = os.path.join(system_path, subdir)
         if not os.path.isdir(subdir_path):
             continue
         for entry in os.listdir(subdir_path):
@@ -150,17 +156,26 @@ def remove_media_files(rom_path, system_path):
     return results
 
 
+def get_media_image_path(system_path: str, rom_filename: str) -> str:
+    """
+    ROM için kapak resmi yolunu döndürür.
+    Göreli yol: ./images/RomAdı.jpg
+    """
+    stem = os.path.splitext(rom_filename)[0]
+    return f"./images/{stem}.jpg"
+
+
+def get_media_image_dest(system_path: str, rom_filename: str) -> str:
+    """
+    ROM için kapak resmi tam disk yolunu döndürür.
+    """
+    stem = os.path.splitext(rom_filename)[0]
+    return os.path.join(system_path, "images", f"{stem}.jpg")
+
+
 # ─── EKLEME ──────────────────────────────────────────────────────────────────
 
 def add_roms(source_paths, dest_system_path, conflict_callback=None):
-    """
-    ROM dosyalarını hedef sistem klasörüne kopyalar.
-    - macOS gizli dosyaları (._*, .*) atlanır
-    - shutil.copyfile kullanılır (metadata kopyalamaz, FAT32 uyumlu)
-
-    Returns:
-        {"success": [...], "failed": [...], "skipped": [...], "cancelled": bool}
-    """
     results = {"success": [], "failed": [], "skipped": [], "cancelled": False}
 
     valid_paths = [p for p in source_paths if _is_valid_rom_source(p)]
@@ -218,13 +233,6 @@ def add_roms(source_paths, dest_system_path, conflict_callback=None):
 # ─── SİLME ───────────────────────────────────────────────────────────────────
 
 def delete_games(roms, system_path, progress_callback=None):
-    """
-    Bir oyunu tüm bileşenleriyle siler:
-      1. Apple Double (._) dosyası
-      2. Media dosyaları
-      3. gamelist.xml kaydı
-      4. ROM dosyası
-    """
     results = {"success": [], "failed": []}
     total = len(roms)
 
